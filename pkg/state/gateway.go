@@ -477,12 +477,24 @@ func (s *GatewayState) BuildInternalRoutes(ctx BuildInternalRoutesContext) []Int
 								Name:      string(backendRef.Name),
 							}
 							var appProtocol *string
-							if svc, ok := ctx.Services[backendSvcName]; ok {
-								for _, port := range svc.Spec.Ports {
-									if port.Port == int32(*backendRef.Port) {
-										appProtocol = port.AppProtocol
-										break
-									}
+							svc, ok := ctx.Services[backendSvcName]
+							if !ok {
+								iRule.Error = &ErrorState{
+									Condition: metav1.Condition{
+										Type:    string(gatewayv1.RouteConditionResolvedRefs),
+										Status:  metav1.ConditionFalse,
+										Reason:  string(gatewayv1.RouteReasonBackendNotFound),
+										Message: fmt.Sprintf("Backend service %s not found", backendSvcName),
+									},
+									HTTPStatusCode: http.StatusInternalServerError,
+									HTTPMessage:    fmt.Sprintf("Backend service %s not found", backendSvcName),
+								}
+								continue
+							}
+							for _, port := range svc.Spec.Ports {
+								if port.Port == int32(*backendRef.Port) {
+									appProtocol = port.AppProtocol
+									break
 								}
 							}
 
@@ -584,7 +596,7 @@ func (s *GatewayState) BuildInternalRoutes(ctx BuildInternalRoutesContext) []Int
 		}
 
 		// GRPCRoutes
-		if listener.Protocol == gatewayv1.HTTPProtocolType || listener.Protocol == gatewayv1.HTTPSProtocolType || listener.Protocol == "TLS" {
+		if listener.Protocol == gatewayv1.HTTPProtocolType || listener.Protocol == gatewayv1.HTTPSProtocolType {
 			for _, route := range ctx.GRPCRoutes {
 				bound := false
 				for i := range route.Spec.ParentRefs {

@@ -210,7 +210,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, backend state.In
 		proxy.Transport = &http.Transport{
 			TLSClientConfig: tlsConfig,
 		}
-	} else if state.ValueOf(backend.AppProtocol) == "kubernetes.io/h2c" {
+	} else if state.ValueOf(backend.AppProtocol) == "kubernetes.io/h2c" || state.ValueOf(backend.AppProtocol) == "h2c" || state.ValueOf(backend.AppProtocol) == "grpc" {
 		proxy.Transport = &http2.Transport{
 			AllowHTTP: true,
 			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
