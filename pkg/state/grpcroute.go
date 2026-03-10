@@ -165,22 +165,6 @@ done:
 	}
 }
 
-func (s *GRPCRouteState) IsAccepted(controllerName string) bool {
-	if s.GRPCRoute == nil {
-		return false
-	}
-	for _, ps := range s.GRPCRoute.Status.Parents {
-		if string(ps.ControllerName) == controllerName {
-			for _, c := range ps.Conditions {
-				if c.Type == string(gatewayv1.RouteConditionAccepted) && c.Status == metav1.ConditionTrue {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
-
 func (s *GRPCRouteState) MatchesGateway(gw *gatewayv1.Gateway, controllerName string) bool {
 	if s.GRPCRoute == nil {
 		return false

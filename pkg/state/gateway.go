@@ -100,6 +100,9 @@ type ErrorState struct {
 	// HTTPMessage is the message to return in the HTTP response body.
 	// This is the "user-facing" error message.
 	HTTPMessage string
+
+	// GRPCStatus is the gRPC status code to return in the gRPC response.
+	GRPCStatus *int
 }
 
 type InternalRule struct {
@@ -608,109 +611,139 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 			ir := InternalRoute{
 				Hostnames: effectiveHostnames,
 			}
-
-			resolvedRefsCond := route.ComputeResolvedRefsCondition()
-
 			for _, rule := range route.Spec.Rules {
 				iRule := InternalRule{}
 
-				if resolvedRefsCond.Status == metav1.ConditionFalse {
-					iRule.Error = &ErrorState{
-						Condition:      resolvedRefsCond,
-						HTTPStatusCode: http.StatusInternalServerError,
-						HTTPMessage:    resolvedRefsCond.Message,
+				for _, backendRef := range rule.BackendRefs {
+					kind := ValueOf(backendRef.Kind)
+					if kind == "" {
+						kind = "Service"
 					}
-				} else {
-					for _, backendRef := range rule.BackendRefs {
-						kind := ValueOf(backendRef.Kind)
-						if kind == "" {
-							kind = "Service"
+
+					unavail := 14 // codes.Unavailable
+					if kind != "Service" {
+						iRule.Error = &ErrorState{
+							Condition: metav1.Condition{
+								Type:    string(gatewayv1.RouteConditionResolvedRefs),
+								Status:  metav1.ConditionFalse,
+								Reason:  string(gatewayv1.RouteReasonInvalidKind),
+								Message: fmt.Sprintf("Unsupported backend kind: %s", kind),
+							},
+							HTTPStatusCode: http.StatusOK,
+							HTTPMessage:    fmt.Sprintf("Unsupported backend kind: %s", kind),
+							GRPCStatus:     &unavail,
 						}
-						if kind != "Service" {
+						continue
+					}
+
+					backendSvcNamespace := route.Namespace
+					if backendRef.Namespace != nil {
+						backendSvcNamespace = string(*backendRef.Namespace)
+					}
+
+					backendSvcName := types.NamespacedName{
+						Namespace: backendSvcNamespace,
+						Name:      string(backendRef.Name),
+					}
+
+					var port int32 = 0
+					if backendRef.Port != nil {
+						port = int32(*backendRef.Port)
+					} else {
+						if svc, ok := services[backendSvcName]; ok {
+							if len(svc.Spec.Ports) == 1 {
+								port = svc.Spec.Ports[0].Port
+							} else if len(svc.Spec.Ports) > 1 {
+								iRule.Error = &ErrorState{
+									Condition: metav1.Condition{
+										Type:    string(gatewayv1.RouteConditionResolvedRefs),
+										Status:  metav1.ConditionFalse,
+										Reason:  string(gatewayv1.RouteReasonUnsupportedValue),
+										Message: "Service has multiple ports and backendRef.Port is nil",
+									},
+									HTTPStatusCode: http.StatusOK,
+									HTTPMessage:    "Service has multiple ports and backendRef.Port is nil",
+									GRPCStatus:     &unavail,
+								}
+								break
+							}
+						} else {
 							iRule.Error = &ErrorState{
 								Condition: metav1.Condition{
 									Type:    string(gatewayv1.RouteConditionResolvedRefs),
 									Status:  metav1.ConditionFalse,
-									Reason:  string(gatewayv1.RouteReasonInvalidKind),
-									Message: fmt.Sprintf("Unsupported backend kind: %s", kind),
+									Reason:  string(gatewayv1.RouteReasonBackendNotFound),
+									Message: "Backend service not found",
 								},
-								HTTPStatusCode: http.StatusInternalServerError,
-								HTTPMessage:    fmt.Sprintf("Unsupported backend kind: %s", kind),
+								HTTPStatusCode: http.StatusOK,
+								HTTPMessage:    "Backend service not found",
+								GRPCStatus:     &unavail,
 							}
-							continue
+							break
 						}
+					}
 
-						if backendRef.Port == nil {
-							continue
-						}
+					if port == 0 {
+						continue
+					}
 
-						backendSvcNamespace := route.Namespace
-						if backendRef.Namespace != nil {
-							backendSvcNamespace = string(*backendRef.Namespace)
-						}
-
-						backendSvcName := types.NamespacedName{
-							Namespace: backendSvcNamespace,
-							Name:      string(backendRef.Name),
-						}
-						var appProtocol *string
-						if svc, ok := services[backendSvcName]; ok {
-							for _, port := range svc.Spec.Ports {
-								if port.Port == int32(*backendRef.Port) {
-									appProtocol = port.AppProtocol
-									break
-								}
-							}
-						}
-
-						// Check for BackendTLSPolicy
-						var tlsConfig *InternalTLSConfig
-						for _, policy := range backendTLSPolicies {
-							if tlsConfig != nil {
+					var appProtocol *string
+					if svc, ok := services[backendSvcName]; ok {
+						for _, p := range svc.Spec.Ports {
+							if p.Port == port {
+								appProtocol = p.AppProtocol
 								break
 							}
-							for _, targetRef := range policy.Spec.TargetRefs {
-								if string(targetRef.Group) == "" && string(targetRef.Kind) == "Service" &&
-									string(targetRef.Name) == string(backendRef.Name) &&
-									policy.Namespace == backendSvcNamespace {
-									// Found a policy targeting this service
-									https := "https"
-									appProtocol = &https
+						}
+					}
 
-									var caCerts [][]byte
-									for _, caRef := range policy.Spec.Validation.CACertificateRefs {
-										if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
-											cmName := types.NamespacedName{Namespace: policy.Namespace, Name: string(caRef.Name)}
-											if cm, ok := configMaps[cmName]; ok {
-												if data, ok := cm.Data["ca.crt"]; ok {
-													caCerts = append(caCerts, []byte(data))
-												} else if data, ok := cm.BinaryData["ca.crt"]; ok {
-													caCerts = append(caCerts, data)
-												}
+					// Check for BackendTLSPolicy
+					var tlsConfig *InternalTLSConfig
+					for _, policy := range backendTLSPolicies {
+						if tlsConfig != nil {
+							break
+						}
+						for _, targetRef := range policy.Spec.TargetRefs {
+							if string(targetRef.Group) == "" && string(targetRef.Kind) == "Service" &&
+								string(targetRef.Name) == string(backendRef.Name) &&
+								policy.Namespace == backendSvcNamespace {
+								// Found a policy targeting this service
+								https := "https"
+								appProtocol = &https
+
+								var caCerts [][]byte
+								for _, caRef := range policy.Spec.Validation.CACertificateRefs {
+									if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
+										cmName := types.NamespacedName{Namespace: policy.Namespace, Name: string(caRef.Name)}
+										if cm, ok := configMaps[cmName]; ok {
+											if data, ok := cm.Data["ca.crt"]; ok {
+												caCerts = append(caCerts, []byte(data))
+											} else if data, ok := cm.BinaryData["ca.crt"]; ok {
+												caCerts = append(caCerts, data)
 											}
 										}
 									}
-
-									tlsConfig = &InternalTLSConfig{
-										Hostname: string(policy.Spec.Validation.Hostname),
-										CACerts:  caCerts,
-									}
-									break
 								}
+
+								tlsConfig = &InternalTLSConfig{
+									Hostname: string(policy.Spec.Validation.Hostname),
+									CACerts:  caCerts,
+								}
+								break
 							}
 						}
-
-						iRule.Backend = &InternalBackend{
-							Host:        fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, backendSvcNamespace),
-							Port:        int32(*backendRef.Port),
-							AppProtocol: appProtocol,
-							TLSConfig:   tlsConfig,
-						}
-						iRule.Error = nil
-
-						// For minimal implementation, we just take the first Service backendRef for each rule
-						break
 					}
+
+					iRule.Backend = &InternalBackend{
+						Host:        fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, backendSvcNamespace),
+						Port:        port,
+						AppProtocol: appProtocol,
+						TLSConfig:   tlsConfig,
+					}
+					iRule.Error = nil
+
+					// For minimal implementation, we just take the first Service backendRef for each rule
+					break
 				}
 
 				for _, match := range rule.Matches {

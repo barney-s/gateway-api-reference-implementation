@@ -75,39 +75,60 @@ func (r *GRPCRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	updated := false
-	if len(route.Status.Parents) != len(newParents) {
-		updated = true
-	} else {
-		for i := range newParents {
-			if !reflect.DeepEqual(route.Status.Parents[i].ParentRef, newParents[i].ParentRef) ||
-				string(route.Status.Parents[i].ControllerName) != string(newParents[i].ControllerName) ||
-				len(route.Status.Parents[i].Conditions) != len(newParents[i].Conditions) {
-				updated = true
-				break
-			}
-			for j := range newParents[i].Conditions {
-				matched := false
-				for k := range route.Status.Parents[i].Conditions {
-					if route.Status.Parents[i].Conditions[k].Type == newParents[i].Conditions[j].Type {
-						if route.Status.Parents[i].Conditions[k].Status == newParents[i].Conditions[j].Status &&
-							route.Status.Parents[i].Conditions[k].ObservedGeneration == newParents[i].Conditions[j].ObservedGeneration &&
-							route.Status.Parents[i].Conditions[k].Reason == newParents[i].Conditions[j].Reason &&
-							route.Status.Parents[i].Conditions[k].Message == newParents[i].Conditions[j].Message {
-							matched = true
-						}
-						break
-					}
-				}
-				if !matched {
-					updated = true
-					break
-				}
-			}
-			if updated {
+	var mergedParents []gatewayv1.RouteParentStatus
+	for _, existingParent := range route.Status.Parents {
+		if string(existingParent.ControllerName) != ControllerName {
+			mergedParents = append(mergedParents, existingParent)
+			continue
+		}
+		var matchedNewParent *gatewayv1.RouteParentStatus
+		for _, np := range newParents {
+			ns1 := existingParent.ParentRef.Namespace
+			ns2 := np.ParentRef.Namespace
+			if existingParent.ParentRef.Name == np.ParentRef.Name &&
+				((ns1 == nil && ns2 == nil) || (ns1 != nil && ns2 != nil && *ns1 == *ns2)) &&
+				((existingParent.ParentRef.SectionName == nil && np.ParentRef.SectionName == nil) || (existingParent.ParentRef.SectionName != nil && np.ParentRef.SectionName != nil && *existingParent.ParentRef.SectionName == *np.ParentRef.SectionName)) {
+				matchedNewParent = &np
 				break
 			}
 		}
+		if matchedNewParent != nil {
+			mergedParents = append(mergedParents, *matchedNewParent)
+		} else {
+			updated = true
+		}
 	}
+
+	for _, np := range newParents {
+		found := false
+		for _, mp := range mergedParents {
+			ns1 := mp.ParentRef.Namespace
+			ns2 := np.ParentRef.Namespace
+			if mp.ControllerName == ControllerName && mp.ParentRef.Name == np.ParentRef.Name &&
+				((ns1 == nil && ns2 == nil) || (ns1 != nil && ns2 != nil && *ns1 == *ns2)) &&
+				((mp.ParentRef.SectionName == nil && np.ParentRef.SectionName == nil) || (mp.ParentRef.SectionName != nil && np.ParentRef.SectionName != nil && *mp.ParentRef.SectionName == *np.ParentRef.SectionName)) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			mergedParents = append(mergedParents, np)
+			updated = true
+		}
+	}
+
+	if !updated && len(route.Status.Parents) == len(mergedParents) {
+		for i := range mergedParents {
+			if !reflect.DeepEqual(route.Status.Parents[i], mergedParents[i]) {
+				updated = true
+				break
+			}
+		}
+	} else {
+		updated = true
+	}
+
+	newParents = mergedParents
 
 	if updated {
 		route.Status.Parents = newParents

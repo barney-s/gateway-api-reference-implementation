@@ -16,6 +16,7 @@ package state
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 
 	corev1 "k8s.io/api/core/v1"
@@ -215,6 +216,17 @@ func (s *State) GetHTTPRoutes() []*HTTPRouteState {
 	for _, route := range s.httpRoutes {
 		routes = append(routes, route)
 	}
+	sort.Slice(routes, func(i, j int) bool {
+		r1 := routes[i].HTTPRoute
+		r2 := routes[j].HTTPRoute
+		if r1.CreationTimestamp.Time.Equal(r2.CreationTimestamp.Time) {
+			if r1.Namespace == r2.Namespace {
+				return r1.Name < r2.Name
+			}
+			return r1.Namespace < r2.Namespace
+		}
+		return r1.CreationTimestamp.Time.Before(r2.CreationTimestamp.Time)
+	})
 	return routes
 }
 
@@ -226,6 +238,17 @@ func (s *State) GetGRPCRoutes() []*GRPCRouteState {
 	for _, route := range s.grpcRoutes {
 		routes = append(routes, route)
 	}
+	sort.Slice(routes, func(i, j int) bool {
+		r1 := routes[i].GRPCRoute
+		r2 := routes[j].GRPCRoute
+		if r1.CreationTimestamp.Time.Equal(r2.CreationTimestamp.Time) {
+			if r1.Namespace == r2.Namespace {
+				return r1.Name < r2.Name
+			}
+			return r1.Namespace < r2.Namespace
+		}
+		return r1.CreationTimestamp.Time.Before(r2.CreationTimestamp.Time)
+	})
 	return routes
 }
 

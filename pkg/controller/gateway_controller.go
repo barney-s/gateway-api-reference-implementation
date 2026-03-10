@@ -184,9 +184,13 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		attachedRoutes := 0
 		for _, route := range httpRoutes {
 			for _, parentRef := range route.Spec.ParentRefs {
-				if string(parentRef.Name) == gw.Name {
+				ns := string(state.ValueOf(parentRef.Namespace))
+				if ns == "" {
+					ns = route.Namespace
+				}
+				if string(parentRef.Name) == gw.Name && ns == gw.Namespace {
 					if sn := state.ValueOf(parentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
-						if route.IsAccepted(ControllerName) {
+						if route.MatchesGateway(gw, ControllerName) {
 							attachedRoutes++
 							break
 						}
@@ -196,9 +200,13 @@ func (r *GatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 		for _, route := range grpcRoutes {
 			for _, parentRef := range route.Spec.ParentRefs {
-				if string(parentRef.Name) == gw.Name {
+				ns := string(state.ValueOf(parentRef.Namespace))
+				if ns == "" {
+					ns = route.Namespace
+				}
+				if string(parentRef.Name) == gw.Name && ns == gw.Namespace {
 					if sn := state.ValueOf(parentRef.SectionName); sn == "" || string(sn) == string(listener.Name) {
-						if route.IsAccepted(ControllerName) {
+						if route.MatchesGateway(gw, ControllerName) {
 							attachedRoutes++
 							break
 						}
@@ -343,9 +351,13 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			for _, parentRef := range route.Spec.ParentRefs {
 				if string(state.ValueOf(parentRef.Group)) == "" || string(state.ValueOf(parentRef.Group)) == "gateway.networking.k8s.io" {
 					if string(state.ValueOf(parentRef.Kind)) == "" || string(state.ValueOf(parentRef.Kind)) == "Gateway" {
+						ns := string(state.ValueOf(parentRef.Namespace))
+						if ns == "" {
+							ns = route.Namespace
+						}
 						requests = append(requests, ctrl.Request{
 							NamespacedName: types.NamespacedName{
-								Namespace: route.Namespace, // Assuming same namespace for now
+								Namespace: ns,
 								Name:      string(parentRef.Name),
 							},
 						})
@@ -361,9 +373,13 @@ func (r *GatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			for _, parentRef := range route.Spec.ParentRefs {
 				if string(state.ValueOf(parentRef.Group)) == "" || string(state.ValueOf(parentRef.Group)) == "gateway.networking.k8s.io" {
 					if string(state.ValueOf(parentRef.Kind)) == "" || string(state.ValueOf(parentRef.Kind)) == "Gateway" {
+						ns := string(state.ValueOf(parentRef.Namespace))
+						if ns == "" {
+							ns = route.Namespace
+						}
 						requests = append(requests, ctrl.Request{
 							NamespacedName: types.NamespacedName{
-								Namespace: route.Namespace, // Assuming same namespace for now
+								Namespace: ns,
 								Name:      string(parentRef.Name),
 							},
 						})
