@@ -307,33 +307,45 @@ func MatchRoute(routes []InternalRoute, r *http.Request) (*InternalRule, *Intern
 	return bestRule, bestMatch
 }
 
+// MatchWeight represents the precedence of a match.
+// Higher values in the fields indicate a better match.
+type MatchWeight struct {
+	PathTypeWeight  int
+	PathLen         int
+	HeaderCount     int
+	QueryParamCount int
+}
+
+func getMatchWeight(m *InternalMatch) MatchWeight {
+	if m == nil {
+		return MatchWeight{PathTypeWeight: -1}
+	}
+	return MatchWeight{
+		PathTypeWeight:  getPathMatchTypeWeight(getPathMatchType(m)),
+		PathLen:         getPathLen(m),
+		HeaderCount:     len(m.Headers),
+		QueryParamCount: len(m.QueryParams),
+	}
+}
+
 func isBetterMatch(current, best *InternalMatch) bool {
 	if best == nil {
 		return true
 	}
 
-	// 1. Path match type priority: Exact > PathPrefix > None
-	currentType := getPathMatchType(current)
-	bestType := getPathMatchType(best)
+	cw := getMatchWeight(current)
+	bw := getMatchWeight(best)
 
-	if currentType != bestType {
-		return getPathMatchTypeWeight(currentType) > getPathMatchTypeWeight(bestType)
+	if cw.PathTypeWeight != bw.PathTypeWeight {
+		return cw.PathTypeWeight > bw.PathTypeWeight
 	}
-
-	// 2. Longest path match wins
-	currentPathLen := getPathLen(current)
-	bestPathLen := getPathLen(best)
-	if currentPathLen != bestPathLen {
-		return currentPathLen > bestPathLen
+	if cw.PathLen != bw.PathLen {
+		return cw.PathLen > bw.PathLen
 	}
-
-	// 3. Most header matches win
-	if len(current.Headers) != len(best.Headers) {
-		return len(current.Headers) > len(best.Headers)
+	if cw.HeaderCount != bw.HeaderCount {
+		return cw.HeaderCount > bw.HeaderCount
 	}
-
-	// 4. Most query parameter matches win
-	return len(current.QueryParams) > len(best.QueryParams)
+	return cw.QueryParamCount > bw.QueryParamCount
 }
 
 func getPathMatchType(m *InternalMatch) gatewayv1.PathMatchType {
