@@ -209,7 +209,7 @@ func (im *InternalMatch) Matches(req *MatchRequest) bool {
 			matched := false
 			for _, v := range values {
 				if qm.Type == gatewayv1.QueryParamMatchRegularExpression {
-					if qm.MatchRegularExpressionValue != nil && qm.MatchRegularExpressionValue.MatchString(v) {
+					if qm.MatchRegularExpressionValue.MatchString(v) {
 						matched = true
 						break
 					}
@@ -549,18 +549,12 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 					iMatch := InternalMatch{}
 					if match.Path != nil {
 						iMatch.Path = &InternalPathMatch{
-							Type:  ValueOf(match.Path.Type),
+							Type:  ValueOrDefault(match.Path.Type, gatewayv1.PathMatchPathPrefix),
 							Value: ValueOf(match.Path.Value),
-						}
-						if iMatch.Path.Type == "" {
-							iMatch.Path.Type = gatewayv1.PathMatchPathPrefix
 						}
 					}
 					for _, header := range match.Headers {
-						headerType := ValueOf(header.Type)
-						if headerType == "" {
-							headerType = gatewayv1.HeaderMatchExact
-						}
+						headerType := ValueOrDefault(header.Type, gatewayv1.HeaderMatchExact)
 						hm := InternalHeaderMatch{
 							Type:            headerType,
 							Name:            string(header.Name),
@@ -582,10 +576,7 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 						}
 						seenQueryParams[name] = true
 
-						queryParamType := ValueOf(queryParam.Type)
-						if queryParamType == "" {
-							queryParamType = gatewayv1.QueryParamMatchExact
-						}
+						queryParamType := ValueOrDefault(queryParam.Type, gatewayv1.QueryParamMatchExact)
 
 						if queryParamType != gatewayv1.QueryParamMatchExact && queryParamType != gatewayv1.QueryParamMatchRegularExpression {
 							klog.Errorf("Unsupported query parameter match type: %s", queryParamType)

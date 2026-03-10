@@ -93,6 +93,16 @@ func ValueOf[T any](t *T) T {
 	return *t
 }
 
+// ValueOrDefault returns the value of the pointer if it is not nil and not the zero value, otherwise the default value.
+func ValueOrDefault[T comparable](t *T, def T) T {
+	val := ValueOf(t)
+	var zero T
+	if val == zero {
+		return def
+	}
+	return val
+}
+
 // Ptr returns a pointer to the given value.
 func Ptr[T any](t T) *T {
 	return &t
