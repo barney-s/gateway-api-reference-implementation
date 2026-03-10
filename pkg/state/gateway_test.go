@@ -15,6 +15,8 @@
 package state
 
 import (
+	"net/url"
+	"regexp"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -585,14 +587,224 @@ func TestBuildInternalRoutes(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "query parameter matching with regular expression",
+			gateway: &GatewayState{
+				Gateway: &gatewayv1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "reference-gateway",
+						Namespace: "default",
+					},
+					Spec: gatewayv1.GatewaySpec{
+						Listeners: []gatewayv1.Listener{
+							{
+								Name:     "http",
+								Protocol: gatewayv1.HTTPProtocolType,
+							},
+						},
+					},
+				},
+			},
+			routes: []*HTTPRouteState{
+				{
+					HTTPRoute: &gatewayv1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "route1",
+							Namespace: "default",
+						},
+						Spec: gatewayv1.HTTPRouteSpec{
+							CommonRouteSpec: gatewayv1.CommonRouteSpec{
+								ParentRefs: []gatewayv1.ParentReference{
+									{
+										Name: "reference-gateway",
+									},
+								},
+							},
+							Rules: []gatewayv1.HTTPRouteRule{
+								{
+									Matches: []gatewayv1.HTTPRouteMatch{
+										{
+											QueryParams: []gatewayv1.HTTPQueryParamMatch{
+												{
+													Type:  Ptr(gatewayv1.QueryParamMatchRegularExpression),
+													Name:  "foo",
+													Value: "^bar$",
+												},
+												{
+													Type:  Ptr(gatewayv1.QueryParamMatchRegularExpression),
+													Name:  "invalid",
+													Value: "[a-", // invalid regex
+												},
+												{
+													Type:  Ptr(gatewayv1.QueryParamMatchType("Unsupported")),
+													Name:  "unsupported",
+													Value: "foo", // unsupported type
+												},
+											},
+										},
+									},
+									BackendRefs: []gatewayv1.HTTPBackendRef{
+										{
+											BackendRef: gatewayv1.BackendRef{
+												BackendObjectReference: gatewayv1.BackendObjectReference{
+													Name: "backend-svc",
+													Port: Ptr(gatewayv1.PortNumber(80)),
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+						Status: gatewayv1.HTTPRouteStatus{
+							RouteStatus: gatewayv1.RouteStatus{
+								Parents: []gatewayv1.RouteParentStatus{
+									{
+										ParentRef: gatewayv1.ParentReference{
+											Name: "reference-gateway",
+										},
+										ControllerName: gatewayv1.GatewayController(controllerName),
+										Conditions: []metav1.Condition{
+											{
+												Type:   string(gatewayv1.RouteConditionAccepted),
+												Status: metav1.ConditionTrue,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: []InternalRoute{
+				{
+					Hostnames: []string{"*"},
+					Rules: []InternalRule{
+						{
+							Matches: []InternalMatch{
+								{
+									QueryParams: []InternalQueryParamMatch{
+										{
+											Type:                        gatewayv1.QueryParamMatchRegularExpression,
+											Name:                        "foo",
+											MatchExactValue:             "^bar$",
+											MatchRegularExpressionValue: regexp.MustCompile("^bar$"),
+										},
+									},
+								},
+							},
+							Backend: &InternalBackend{Host: "backend-svc.default.svc.cluster.local", Port: 80},
+						},
+					},
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			actual := tt.gateway.BuildInternalRoutes(tt.routes, tt.services, tt.backendTLSPolicies, tt.configMaps, controllerName)
-			diff := cmp.Diff(tt.expected, actual, cmpopts.IgnoreFields(metav1.Condition{}, "LastTransitionTime", "ObservedGeneration"))
+			diff := cmp.Diff(tt.expected, actual, cmpopts.IgnoreFields(metav1.Condition{}, "LastTransitionTime", "ObservedGeneration"), cmp.Comparer(func(x, y *regexp.Regexp) bool { if x == nil && y == nil { return true }; if x == nil || y == nil { return false }; return x.String() == y.String() }))
 			if diff != "" {
 				t.Errorf("BuildInternalRoutes() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestInternalMatch_Matches(t *testing.T) {
+	tests := []struct {
+		name     string
+		match    InternalMatch
+		reqURL   string
+		expected bool
+	}{
+		{
+			name: "query param exact match",
+			match: InternalMatch{
+				QueryParams: []InternalQueryParamMatch{
+					{
+						Type:            gatewayv1.QueryParamMatchExact,
+						Name:            "foo",
+						MatchExactValue: "bar",
+					},
+				},
+			},
+			reqURL:   "http://example.com/path?foo=bar",
+			expected: true,
+		},
+		{
+			name: "query param exact match - negative",
+			match: InternalMatch{
+				QueryParams: []InternalQueryParamMatch{
+					{
+						Type:            gatewayv1.QueryParamMatchExact,
+						Name:            "foo",
+						MatchExactValue: "bar",
+					},
+				},
+			},
+			reqURL:   "http://example.com/path?foo=baz",
+			expected: false,
+		},
+		{
+			name: "query param regex match",
+			match: InternalMatch{
+				QueryParams: []InternalQueryParamMatch{
+					{
+						Type:                        gatewayv1.QueryParamMatchRegularExpression,
+						Name:                        "foo",
+						MatchRegularExpressionValue: regexp.MustCompile("^b.*r$"),
+					},
+				},
+			},
+			reqURL:   "http://example.com/path?foo=bar",
+			expected: true,
+		},
+		{
+			name: "query param regex match - negative",
+			match: InternalMatch{
+				QueryParams: []InternalQueryParamMatch{
+					{
+						Type:                        gatewayv1.QueryParamMatchRegularExpression,
+						Name:                        "foo",
+						MatchRegularExpressionValue: regexp.MustCompile("^b.*r$"),
+					},
+				},
+			},
+			reqURL:   "http://example.com/path?foo=baz",
+			expected: false,
+		},
+		{
+			name: "query param missing in request",
+			match: InternalMatch{
+				QueryParams: []InternalQueryParamMatch{
+					{
+						Type:            gatewayv1.QueryParamMatchExact,
+						Name:            "foo",
+						MatchExactValue: "bar",
+					},
+				},
+			},
+			reqURL:   "http://example.com/path?other=bar",
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parsedURL, err := url.Parse(tt.reqURL)
+			if err != nil {
+				t.Fatalf("Failed to parse URL: %v", err)
+			}
+			req := &MatchRequest{
+				reqURL: parsedURL,
+				Path:   parsedURL.Path,
+			}
+			actual := tt.match.Matches(req)
+			if actual != tt.expected {
+				t.Errorf("Matches() = %v, want %v", actual, tt.expected)
 			}
 		})
 	}

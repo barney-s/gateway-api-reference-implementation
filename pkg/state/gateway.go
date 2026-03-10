@@ -21,6 +21,9 @@ import (
 	"regexp"
 	"strings"
 
+	"k8s.io/klog/v2"
+	"net/url"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -141,22 +144,42 @@ type InternalMatch struct {
 	QueryParams []InternalQueryParamMatch
 }
 
-func (im *InternalMatch) Matches(path string, header http.Header, query map[string][]string) bool {
+type MatchRequest struct {
+	Path   string
+	Header http.Header
+	Method string
+
+	reqURL *url.URL
+	query  map[string][]string
+}
+
+func (m *MatchRequest) GetQuery() map[string][]string {
+	if m.query == nil {
+		if m.reqURL != nil {
+			m.query = m.reqURL.Query()
+		} else {
+			m.query = make(map[string][]string)
+		}
+	}
+	return m.query
+}
+
+func (im *InternalMatch) Matches(req *MatchRequest) bool {
 	if im.Path != nil {
 		switch im.Path.Type {
 		case gatewayv1.PathMatchExact:
-			if path != im.Path.Value {
+			if req.Path != im.Path.Value {
 				return false
 			}
 		case gatewayv1.PathMatchPathPrefix:
-			if !hasPathPrefix(path, im.Path.Value) {
+			if !hasPathPrefix(req.Path, im.Path.Value) {
 				return false
 			}
 		}
 	}
 
 	for _, hm := range im.Headers {
-		values := header[http.CanonicalHeaderKey(hm.Name)]
+		values := req.Header[http.CanonicalHeaderKey(hm.Name)]
 		matched := false
 		for _, v := range values {
 			if hm.Type == gatewayv1.HeaderMatchRegularExpression {
@@ -176,24 +199,30 @@ func (im *InternalMatch) Matches(path string, header http.Header, query map[stri
 		}
 	}
 
-	for _, qm := range im.QueryParams {
-		values := query[qm.Name]
-		matched := false
-		for _, v := range values {
-			if qm.Type == gatewayv1.QueryParamMatchRegularExpression {
-				if qm.MatchRegularExpressionValue != nil && qm.MatchRegularExpressionValue.MatchString(v) {
-					matched = true
-					break
-				}
-			} else {
-				if v == qm.MatchExactValue {
-					matched = true
-					break
+	if len(im.QueryParams) > 0 {
+		query := req.GetQuery()
+		if len(query) == 0 {
+			return false
+		}
+		for _, qm := range im.QueryParams {
+			values := query[qm.Name]
+			matched := false
+			for _, v := range values {
+				if qm.Type == gatewayv1.QueryParamMatchRegularExpression {
+					if qm.MatchRegularExpressionValue != nil && qm.MatchRegularExpressionValue.MatchString(v) {
+						matched = true
+						break
+					}
+				} else if qm.Type == gatewayv1.QueryParamMatchExact {
+					if v == qm.MatchExactValue {
+						matched = true
+						break
+					}
 				}
 			}
-		}
-		if !matched {
-			return false
+			if !matched {
+				return false
+			}
 		}
 	}
 
@@ -242,7 +271,12 @@ func MatchRoute(routes []InternalRoute, r *http.Request) (*InternalRule, *Intern
 	var bestRule *InternalRule
 	var bestMatch *InternalMatch
 
-	query := r.URL.Query()
+	req := &MatchRequest{
+		Path:   r.URL.Path,
+		Header: r.Header,
+		Method: r.Method,
+		reqURL: r.URL,
+	}
 
 	for i := range routes {
 		route := &routes[i]
@@ -254,7 +288,7 @@ func MatchRoute(routes []InternalRoute, r *http.Request) (*InternalRule, *Intern
 			rule := &route.Rules[j]
 			for k := range rule.Matches {
 				match := &rule.Matches[k]
-				if match.Matches(r.URL.Path, r.Header, query) {
+				if match.Matches(req) {
 					if isBetterMatch(match, bestMatch) {
 						bestMatch = match
 						bestRule = rule
@@ -265,7 +299,6 @@ func MatchRoute(routes []InternalRoute, r *http.Request) (*InternalRule, *Intern
 				// Rule with no matches always matches, but is the least specific
 				if bestRule == nil {
 					bestRule = rule
-					bestMatch = &InternalMatch{}
 				}
 			}
 		}
@@ -541,21 +574,37 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 						}
 						iMatch.Headers = append(iMatch.Headers, hm)
 					}
+					seenQueryParams := make(map[string]bool)
 					for _, queryParam := range match.QueryParams {
+						name := string(queryParam.Name)
+						if seenQueryParams[name] {
+							continue
+						}
+						seenQueryParams[name] = true
+
 						queryParamType := ValueOf(queryParam.Type)
 						if queryParamType == "" {
 							queryParamType = gatewayv1.QueryParamMatchExact
 						}
+
+						if queryParamType != gatewayv1.QueryParamMatchExact && queryParamType != gatewayv1.QueryParamMatchRegularExpression {
+							klog.Errorf("Unsupported query parameter match type: %s", queryParamType)
+							continue
+						}
+
 						qm := InternalQueryParamMatch{
 							Type:            queryParamType,
-							Name:            string(queryParam.Name),
+							Name:            name,
 							MatchExactValue: queryParam.Value,
 						}
+
 						if queryParamType == gatewayv1.QueryParamMatchRegularExpression {
 							re, err := regexp.Compile(queryParam.Value)
-							if err == nil {
-								qm.MatchRegularExpressionValue = re
+							if err != nil {
+								klog.Errorf("Invalid regular expression for query parameter match %q: %v", name, err)
+								continue // skip appending this invalid match
 							}
+							qm.MatchRegularExpressionValue = re
 						}
 						iMatch.QueryParams = append(iMatch.QueryParams, qm)
 					}
