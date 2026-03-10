@@ -42,16 +42,6 @@ func (s *GatewayState) GetHTTPRoutes(allRoutes []*HTTPRouteState, controllerName
 	return matches
 }
 
-func (s *GatewayState) GetGRPCRoutes(allRoutes []*GRPCRouteState, controllerName string) []*GRPCRouteState {
-	var matches []*GRPCRouteState
-	for _, route := range allRoutes {
-		if route.MatchesGateway(s.Gateway, controllerName) {
-			matches = append(matches, route)
-		}
-	}
-	return matches
-}
-
 func (s *HTTPRouteState) GetHostnames() []string {
 	var hostnames []string
 	for _, h := range s.Spec.Hostnames {
@@ -328,7 +318,7 @@ func getPathLen(m *InternalMatch) int {
 	return len(m.Path.Value)
 }
 
-func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services map[types.NamespacedName]*corev1.Service, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, controllerName string) []InternalRoute {
+func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, grpcRoutes []*GRPCRouteState, services map[types.NamespacedName]*corev1.Service, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, controllerName string) []InternalRoute {
 	// Sort policies by creation timestamp, then by namespaced name to ensure deterministic conflict resolution.
 	sort.SliceStable(backendTLSPolicies, func(i, j int) bool {
 		if backendTLSPolicies[i].CreationTimestamp.Time.Before(backendTLSPolicies[j].CreationTimestamp.Time) {
@@ -569,6 +559,146 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 			}
 			internalRoutes = append(internalRoutes, ir)
 			_ = matchingParentRef // keep for now
+		}
+	}
+
+	for _, listener := range s.Spec.Listeners {
+		// Check if listener is compatible with GRPCRoute
+		if listener.Protocol != gatewayv1.HTTPProtocolType && listener.Protocol != gatewayv1.HTTPSProtocolType {
+			continue
+		}
+
+		for _, route := range grpcRoutes {
+			bound := false
+			for i := range route.Spec.ParentRefs {
+				parentRef := &route.Spec.ParentRefs[i]
+				if string(parentRef.Name) != s.Name {
+					continue
+				}
+				if ns := ValueOf(parentRef.Namespace); ns != "" && string(ns) != s.Namespace {
+					continue
+				}
+				if sn := ValueOf(parentRef.SectionName); sn != "" && sn != listener.Name {
+					continue
+				}
+				if cond := route.ComputeAcceptedCondition(*parentRef, []*GatewayState{s}); cond.Status == metav1.ConditionTrue {
+					bound = true
+					break
+				}
+			}
+
+			if !bound {
+				continue
+			}
+
+			routeHostnames := route.Hostnames
+			listenerHostname := ValueOf(listener.Hostname)
+
+			effectiveHostnames := IntersectHostnames(routeHostnames, string(listenerHostname))
+			if len(effectiveHostnames) == 0 && len(routeHostnames) > 0 {
+				continue
+			}
+
+			ir := InternalRoute{
+				Hostnames: effectiveHostnames,
+			}
+
+			resolvedRefsCond := route.ComputeResolvedRefsCondition(services)
+
+			for _, rule := range route.Spec.Rules {
+				iRule := InternalRule{}
+
+				if resolvedRefsCond.Status == metav1.ConditionFalse {
+					iRule.Error = &ErrorState{
+						Condition:      resolvedRefsCond,
+						HTTPStatusCode: 500,
+						HTTPMessage:    resolvedRefsCond.Message,
+					}
+				} else {
+					for _, backendRef := range rule.BackendRefs {
+						ns := s.Namespace
+						if backendRef.Namespace != nil {
+							ns = string(*backendRef.Namespace)
+						}
+
+						if svc, ok := services[types.NamespacedName{Namespace: ns, Name: string(backendRef.Name)}]; ok {
+							targetPort := int32(80)
+							if backendRef.Port != nil {
+								targetPort = int32(*backendRef.Port)
+							}
+
+							iRule.Backend = &InternalBackend{
+								Host: svc.Spec.ClusterIP,
+								Port: targetPort,
+							}
+							break
+						}
+					}
+				}
+
+				for _, match := range rule.Matches {
+					iMatch := InternalMatch{}
+					methodPOST := gatewayv1.HTTPMethod("POST")
+					iMatch.Method = &methodPOST
+
+					if match.Method != nil {
+						svc := ""
+						if match.Method.Service != nil {
+							svc = *match.Method.Service
+						}
+						meth := ""
+						if match.Method.Method != nil {
+							meth = *match.Method.Method
+						}
+
+						pathType := gatewayv1.PathMatchExact
+						pathVal := "/" + svc + "/" + meth
+
+						if match.Method.Type != nil && *match.Method.Type == gatewayv1.GRPCMethodMatchRegularExpression {
+							// We don't have Regex in InternalPathMatch, fallback to prefix or just exact for now
+							// The proxy might not support regex path matching perfectly but we map it here
+							pathType = gatewayv1.PathMatchPathPrefix
+						} else if meth == "" {
+							pathType = gatewayv1.PathMatchPathPrefix
+							pathVal = "/" + svc + "/"
+						}
+
+						iMatch.Path = &InternalPathMatch{
+							Type:  pathType,
+							Value: pathVal,
+						}
+					}
+
+					// Basic header translation
+					for _, h := range match.Headers {
+						htype := gatewayv1.HeaderMatchExact
+						ihm := InternalHeaderMatch{
+							Name: string(h.Name),
+						}
+						if h.Type != nil && *h.Type == gatewayv1.GRPCHeaderMatchRegularExpression {
+							htype = gatewayv1.HeaderMatchRegularExpression
+							ihm.MatchRegularExpressionValue, _ = regexp.Compile(h.Value)
+						} else {
+							ihm.MatchExactValue = h.Value
+						}
+						ihm.Type = htype
+						iMatch.Headers = append(iMatch.Headers, ihm)
+					}
+
+					iRule.Matches = append(iRule.Matches, iMatch)
+				}
+
+				// Default match if none specified
+				if len(rule.Matches) == 0 {
+					methodPOST := gatewayv1.HTTPMethod("POST")
+					iRule.Matches = []InternalMatch{
+						{Method: &methodPOST},
+					}
+				}
+
+				ir.Rules = append(ir.Rules, iRule)
+			}
+			internalRoutes = append(internalRoutes, ir)
 		}
 	}
 

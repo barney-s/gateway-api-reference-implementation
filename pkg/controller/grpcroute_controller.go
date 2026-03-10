@@ -25,6 +25,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"errors"
 
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -37,7 +40,7 @@ type GRPCRouteReconciler struct {
 }
 
 func (r *GRPCRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	l := log.FromContext(ctx)
+	l := log.FromContext(ctx).WithValues("grpcroute", req.NamespacedName)
 
 	route := &gatewayv1.GRPCRoute{}
 	if err := r.Get(ctx, req.NamespacedName, route); err != nil {
@@ -48,13 +51,39 @@ func (r *GRPCRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// If the route is not accepted, we still update the state but it won't be used for proxying
-	validationCondition := r.State.UpsertGRPCRoute(route)
+	if !route.DeletionTimestamp.IsZero() {
+		// Route is being deleted, ignore or handle finalizer
+		return ctrl.Result{}, nil
+	}
 
-	// Update status
-	// For each parentRef, we should add a ParentStatus
 	gateways := r.State.GetGateways()
-	rs := state.GRPCRouteState{GRPCRoute: route}
+	
+	// Create a temporary state just to validate and compute conditions
+	var hostnames []string
+	for _, h := range route.Spec.Hostnames {
+		hostnames = append(hostnames, string(h))
+	}
+	rs := &state.GRPCRouteState{GRPCRoute: route, Hostnames: hostnames}
+	
+	validationCondition := metav1.Condition{
+		Type:               string(gatewayv1.RouteConditionAccepted),
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: route.Generation,
+		LastTransitionTime: metav1.Now(),
+		Reason:             string(gatewayv1.RouteReasonAccepted),
+		Message:            "Route accepted by reference implementation",
+	}
+	
+	if err := rs.Validate(); err != nil {
+		validationCondition.Status = metav1.ConditionFalse
+		var valErr *state.ValidationError
+		if errors.As(err, &valErr) {
+			validationCondition.Reason = string(valErr.Reason)
+		} else {
+			validationCondition.Reason = string(gatewayv1.RouteReasonUnsupportedValue)
+		}
+		validationCondition.Message = err.Error()
+	}
 
 	var newParents []gatewayv1.RouteParentStatus
 	for _, parentRef := range route.Spec.ParentRefs {
@@ -68,53 +97,98 @@ func (r *GRPCRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			ControllerName: ControllerName,
 			Conditions: []metav1.Condition{
 				acceptedCondition,
-				rs.ComputeResolvedRefsCondition(),
+				rs.ComputeResolvedRefsCondition(r.State.GetServices()),
 			},
 		})
 	}
 
-	updated := false
-	if len(route.Status.Parents) != len(newParents) {
-		updated = true
-	} else {
-		for i := range newParents {
-			if len(route.Status.Parents) <= i {
-				updated = true
-				break
-			}
-			// Simplified comparison for brevity, similar to HTTPRoute controller
-			if string(route.Status.Parents[i].ParentRef.Name) != string(newParents[i].ParentRef.Name) ||
-				string(route.Status.Parents[i].ControllerName) != string(newParents[i].ControllerName) ||
-				len(route.Status.Parents[i].Conditions) != len(newParents[i].Conditions) {
-				updated = true
-				break
-			}
-			for j := range newParents[i].Conditions {
-				matched := false
-				for k := range route.Status.Parents[i].Conditions {
-					if route.Status.Parents[i].Conditions[k].Type == newParents[i].Conditions[j].Type {
-						if route.Status.Parents[i].Conditions[k].Status == newParents[i].Conditions[j].Status &&
-							route.Status.Parents[i].Conditions[k].ObservedGeneration == newParents[i].Conditions[j].ObservedGeneration &&
-							route.Status.Parents[i].Conditions[k].Reason == newParents[i].Conditions[j].Reason &&
-							route.Status.Parents[i].Conditions[k].Message == newParents[i].Conditions[j].Message {
-							matched = true
+	// Merge with existing parents to not overwrite other controllers' statuses
+	var mergedParents []gatewayv1.RouteParentStatus
+	for _, existingParent := range route.Status.Parents {
+		if existingParent.ControllerName != ControllerName {
+			mergedParents = append(mergedParents, existingParent)
+		}
+	}
+	
+	// Preserve LastTransitionTime if condition status/reason didn't change
+	for i, np := range newParents {
+		for j, nc := range np.Conditions {
+			// Find existing condition
+			var existingCond *metav1.Condition
+			for _, ep := range route.Status.Parents {
+				if ep.ControllerName == ControllerName && string(ep.ParentRef.Name) == string(np.ParentRef.Name) {
+					if ep.ParentRef.Namespace == nil && np.ParentRef.Namespace == nil || (ep.ParentRef.Namespace != nil && np.ParentRef.Namespace != nil && *ep.ParentRef.Namespace == *np.ParentRef.Namespace) {
+						if ep.ParentRef.SectionName == nil && np.ParentRef.SectionName == nil || (ep.ParentRef.SectionName != nil && np.ParentRef.SectionName != nil && *ep.ParentRef.SectionName == *np.ParentRef.SectionName) {
+							for _, ec := range ep.Conditions {
+								if ec.Type == nc.Type {
+									existingCond = &ec
+									break
+								}
+							}
 						}
-						break
 					}
 				}
-				if !matched {
-					updated = true
-					break
+			}
+			if existingCond != nil && existingCond.Status == nc.Status && existingCond.Reason == nc.Reason {
+				newParents[i].Conditions[j].LastTransitionTime = existingCond.LastTransitionTime
+			}
+		}
+		mergedParents = append(mergedParents, newParents[i])
+	}
+
+	updated := false
+	if len(route.Status.Parents) != len(mergedParents) {
+		updated = true
+	} else {
+		// simplistic check: if anything changed
+		for i := range mergedParents {
+			matchedParent := false
+			for j := range route.Status.Parents {
+				if route.Status.Parents[j].ControllerName == mergedParents[i].ControllerName && 
+				   string(route.Status.Parents[j].ParentRef.Name) == string(mergedParents[i].ParentRef.Name) {
+				   
+				    // match namespace and section name
+				    nsMatch := (route.Status.Parents[j].ParentRef.Namespace == nil && mergedParents[i].ParentRef.Namespace == nil) || 
+				               (route.Status.Parents[j].ParentRef.Namespace != nil && mergedParents[i].ParentRef.Namespace != nil && *route.Status.Parents[j].ParentRef.Namespace == *mergedParents[i].ParentRef.Namespace)
+				    secMatch := (route.Status.Parents[j].ParentRef.SectionName == nil && mergedParents[i].ParentRef.SectionName == nil) ||
+				                (route.Status.Parents[j].ParentRef.SectionName != nil && mergedParents[i].ParentRef.SectionName != nil && *route.Status.Parents[j].ParentRef.SectionName == *mergedParents[i].ParentRef.SectionName)
+				                
+				    if nsMatch && secMatch {
+						if len(route.Status.Parents[j].Conditions) == len(mergedParents[i].Conditions) {
+							allCondsMatched := true
+							for k := range mergedParents[i].Conditions {
+								condMatched := false
+								for l := range route.Status.Parents[j].Conditions {
+									if route.Status.Parents[j].Conditions[l].Type == mergedParents[i].Conditions[k].Type &&
+										route.Status.Parents[j].Conditions[l].Status == mergedParents[i].Conditions[k].Status &&
+										route.Status.Parents[j].Conditions[l].Reason == mergedParents[i].Conditions[k].Reason &&
+										route.Status.Parents[j].Conditions[l].Message == mergedParents[i].Conditions[k].Message &&
+										route.Status.Parents[j].Conditions[l].ObservedGeneration == mergedParents[i].Conditions[k].ObservedGeneration {
+										condMatched = true
+										break
+									}
+								}
+								if !condMatched {
+									allCondsMatched = false
+									break
+								}
+							}
+							if allCondsMatched {
+								matchedParent = true
+							}
+						}
+					}
 				}
 			}
-			if updated {
+			if !matchedParent {
+				updated = true
 				break
 			}
 		}
 	}
 
 	if updated {
-		route.Status.Parents = newParents
+		route.Status.Parents = mergedParents
 		if err := r.Status().Update(ctx, route); err != nil {
 			l.Error(err, "unable to update GRPCRoute status")
 			return ctrl.Result{}, err
@@ -124,7 +198,9 @@ func (r *GRPCRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	r.State.UpsertGRPCRoute(route)
 	r.updateProxy()
 
-	l.Info("Updated GRPCRoute status and proxy")
+	if updated {
+		l.Info("Updated GRPCRoute status and proxy")
+	}
 
 	return ctrl.Result{}, nil
 }
@@ -133,8 +209,23 @@ func (r *GRPCRouteReconciler) updateProxy() {
 	updateProxy(r.State, r.Proxy)
 }
 
+
 func (r *GRPCRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&gatewayv1.GRPCRoute{}).
+		Watches(
+			&gatewayv1.Gateway{},
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				// Requeue all GRPCRoutes
+				routes := r.State.GetGRPCRoutes()
+				var reqs []reconcile.Request
+				for _, route := range routes {
+					reqs = append(reqs, reconcile.Request{
+						NamespacedName: client.ObjectKey{Namespace: route.Namespace, Name: route.Name},
+					})
+				}
+				return reqs
+			}),
+		).
 		Complete(r)
 }

@@ -17,7 +17,9 @@ package state
 import (
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -76,7 +78,11 @@ func TestGRPCRouteComputeAcceptedCondition(t *testing.T) {
 					Hostnames: tt.routeHostnames,
 				},
 			}
-			s := &GRPCRouteState{GRPCRoute: route}
+			var hostnames []string
+			for _, h := range route.Spec.Hostnames {
+				hostnames = append(hostnames, string(h))
+			}
+			s := &GRPCRouteState{GRPCRoute: route, Hostnames: hostnames}
 			gw := &GatewayState{
 				Gateway: &gatewayv1.Gateway{
 					ObjectMeta: metav1.ObjectMeta{
@@ -114,5 +120,58 @@ func TestGRPCRouteComputeAcceptedCondition(t *testing.T) {
 				t.Errorf("ComputeAcceptedCondition() reason = %v, want %v", cond.Reason, tt.wantReason)
 			}
 		})
+	}
+}
+
+func TestGRPCRouteValidate(t *testing.T) {
+	route := &gatewayv1.GRPCRoute{
+		Spec: gatewayv1.GRPCRouteSpec{
+			Rules: []gatewayv1.GRPCRouteRule{
+				{
+					Matches: []gatewayv1.GRPCRouteMatch{
+						{
+							Method: &gatewayv1.GRPCMethodMatch{
+								Type:    Ptr(gatewayv1.GRPCMethodMatchRegularExpression),
+								Service: Ptr("invalid[regex"),
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	rs := &GRPCRouteState{GRPCRoute: route}
+	err := rs.Validate()
+	if err == nil {
+		t.Errorf("Expected validation error for invalid regex")
+	}
+}
+
+func TestGRPCRouteComputeResolvedRefsCondition(t *testing.T) {
+	route := &gatewayv1.GRPCRoute{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default"},
+		Spec: gatewayv1.GRPCRouteSpec{
+			Rules: []gatewayv1.GRPCRouteRule{
+				{
+					BackendRefs: []gatewayv1.GRPCBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Name: "nonexistent",
+									Kind: Ptr(gatewayv1.Kind("Service")),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	rs := &GRPCRouteState{GRPCRoute: route}
+	services := map[types.NamespacedName]*corev1.Service{}
+
+	cond := rs.ComputeResolvedRefsCondition(services)
+	if cond.Status != metav1.ConditionFalse || cond.Reason != string(gatewayv1.RouteReasonBackendNotFound) {
+		t.Errorf("Expected RouteReasonBackendNotFound, got %v", cond.Reason)
 	}
 }

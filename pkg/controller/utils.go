@@ -28,7 +28,7 @@ func updateProxy(st *state.State, p *proxy.Proxy) {
 
 	var proxyRoutes []state.InternalRoute
 	for _, gw := range gateways {
-		proxyRoutes = append(proxyRoutes, gw.BuildInternalRoutes(routes, services, backendTLSPolicies, configMaps, ControllerName)...)
+		proxyRoutes = append(proxyRoutes, gw.BuildInternalRoutes(routes, st.GetGRPCRoutes(), services, backendTLSPolicies, configMaps, ControllerName)...)
 	}
 	p.UpdateRoutes(proxyRoutes)
 }

@@ -15,6 +15,7 @@
 package state
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -147,8 +148,13 @@ func (s *State) DeleteHTTPRoute(name types.NamespacedName) {
 }
 
 func (s *State) UpsertGRPCRoute(route *gatewayv1.GRPCRoute) metav1.Condition {
+	var hostnames []string
+	for _, h := range route.Spec.Hostnames {
+		hostnames = append(hostnames, string(h))
+	}
 	rs := &GRPCRouteState{
-		GRPCRoute: route,
+		GRPCRoute: route.DeepCopy(),
+		Hostnames: hostnames,
 	}
 
 	status := metav1.ConditionTrue
@@ -157,7 +163,12 @@ func (s *State) UpsertGRPCRoute(route *gatewayv1.GRPCRoute) metav1.Condition {
 
 	if err := rs.Validate(); err != nil {
 		status = metav1.ConditionFalse
-		reason = gatewayv1.RouteReasonUnsupportedValue
+		var valErr *ValidationError
+		if errors.As(err, &valErr) {
+			reason = gatewayv1.RouteConditionReason(valErr.Reason)
+		} else {
+			reason = gatewayv1.RouteReasonUnsupportedValue
+		}
 		message = fmt.Sprintf("Invalid route: %v", err)
 	}
 
@@ -210,12 +221,11 @@ func (s *State) GetGateways() []*GatewayState {
 
 func (s *State) GetHTTPRoutes() []*HTTPRouteState {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	var routes []*HTTPRouteState
 	for _, route := range s.httpRoutes {
 		routes = append(routes, route)
 	}
+	s.mu.RUnlock()
 
 	// Sort by creation timestamp, then by namespace/name to ensure deterministic order
 	// and follow Gateway API precedence rules for ties.
@@ -234,12 +244,11 @@ func (s *State) GetHTTPRoutes() []*HTTPRouteState {
 
 func (s *State) GetGRPCRoutes() []*GRPCRouteState {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	var routes []*GRPCRouteState
 	for _, route := range s.grpcRoutes {
 		routes = append(routes, route)
 	}
+	s.mu.RUnlock()
 
 	// Sort by creation timestamp, then by namespace/name to ensure deterministic order
 	// and follow Gateway API precedence rules for ties.
