@@ -342,7 +342,11 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 					continue
 				}
 				// Namespace check (optional for now as per current implementation)
-				if ns := ValueOf(parentRef.Namespace); ns != "" && string(ns) != s.Namespace {
+				expectedNamespace := route.Namespace
+				if parentRef.Namespace != nil {
+					expectedNamespace = string(*parentRef.Namespace)
+				}
+				if s.Namespace != expectedNamespace {
 					continue
 				}
 
@@ -533,9 +537,19 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 							MatchExactValue: header.Value,
 						}
 						if headerType == gatewayv1.HeaderMatchRegularExpression {
-							re, err := regexp.Compile(header.Value)
-							if err == nil {
+							if re := route.GetCompiledHeaderRegex(header.Value); re != nil {
 								hm.MatchRegularExpressionValue = re
+							} else {
+								iRule.Error = &ErrorState{
+									Condition: metav1.Condition{
+										Type:    string(gatewayv1.RouteConditionAccepted),
+										Status:  metav1.ConditionFalse,
+										Reason:  string(gatewayv1.RouteReasonUnsupportedValue),
+										Message: "Invalid regular expression in header match",
+									},
+									HTTPStatusCode: http.StatusInternalServerError,
+									HTTPMessage:    "Invalid regular expression in header match",
+								}
 							}
 						}
 						iMatch.Headers = append(iMatch.Headers, hm)
@@ -558,7 +572,11 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 					continue
 				}
 				// Namespace check (optional for now as per current implementation)
-				if ns := ValueOf(parentRef.Namespace); ns != "" && string(ns) != s.Namespace {
+				expectedNamespace := route.Namespace
+				if parentRef.Namespace != nil {
+					expectedNamespace = string(*parentRef.Namespace)
+				}
+				if s.Namespace != expectedNamespace {
 					continue
 				}
 
@@ -737,9 +755,19 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 							MatchExactValue: header.Value,
 						}
 						if headerType == gatewayv1.GRPCHeaderMatchRegularExpression {
-							re, err := regexp.Compile(header.Value)
-							if err == nil {
+							if re := route.GetCompiledHeaderRegex(header.Value); re != nil {
 								hm.MatchRegularExpressionValue = re
+							} else {
+								iRule.Error = &ErrorState{
+									Condition: metav1.Condition{
+										Type:    string(gatewayv1.RouteConditionAccepted),
+										Status:  metav1.ConditionFalse,
+										Reason:  string(gatewayv1.RouteReasonUnsupportedValue),
+										Message: "Invalid regular expression in header match",
+									},
+									HTTPStatusCode: http.StatusInternalServerError,
+									HTTPMessage:    "Invalid regular expression in header match",
+								}
 							}
 						}
 						iMatch.Headers = append(iMatch.Headers, hm)

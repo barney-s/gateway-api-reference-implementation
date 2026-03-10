@@ -17,6 +17,7 @@ package state
 import (
 	"fmt"
 	"regexp"
+	"sync"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -24,34 +25,54 @@ import (
 
 type GRPCRouteState struct {
 	*gatewayv1.GRPCRoute
+
+	compiledHeaderRegexps map[string]*regexp.Regexp
+	validationOnce        sync.Once
+	validationErr         error
 }
 
 func (s *GRPCRouteState) Validate() error {
-	if s.GRPCRoute == nil {
-		return nil
-	}
-	for _, rule := range s.Spec.Rules {
-		for _, match := range rule.Matches {
-			for _, header := range match.Headers {
-				if ValueOf(header.Type) == gatewayv1.GRPCHeaderMatchRegularExpression {
-					if _, err := regexp.Compile(header.Value); err != nil {
-						return fmt.Errorf("invalid regular expression in header match: %w", err)
+	s.validationOnce.Do(func() {
+		if s.GRPCRoute == nil {
+			return
+		}
+		s.compiledHeaderRegexps = make(map[string]*regexp.Regexp)
+		for _, rule := range s.Spec.Rules {
+			for _, match := range rule.Matches {
+				for _, header := range match.Headers {
+					if ValueOf(header.Type) == gatewayv1.GRPCHeaderMatchRegularExpression {
+						if _, err := regexp.Compile(header.Value); err != nil {
+							s.validationErr = fmt.Errorf("invalid regular expression in header match: %w", err)
+							return
+						} else {
+							s.compiledHeaderRegexps[header.Value] = regexp.MustCompile(header.Value)
+						}
 					}
 				}
-			}
-			if match.Method != nil && ValueOf(match.Method.Type) == gatewayv1.GRPCMethodMatchRegularExpression {
-				if match.Method.Service != nil {
-					if _, err := regexp.Compile(*match.Method.Service); err != nil {
-						return fmt.Errorf("invalid regular expression in method service match: %w", err)
+				if match.Method != nil && ValueOf(match.Method.Type) == gatewayv1.GRPCMethodMatchRegularExpression {
+					if match.Method.Service != nil {
+						if _, err := regexp.Compile(*match.Method.Service); err != nil {
+							s.validationErr = fmt.Errorf("invalid regular expression in method service match: %w", err)
+							return
+						}
 					}
-				}
-				if match.Method.Method != nil {
-					if _, err := regexp.Compile(*match.Method.Method); err != nil {
-						return fmt.Errorf("invalid regular expression in method name match: %w", err)
+					if match.Method.Method != nil {
+						if _, err := regexp.Compile(*match.Method.Method); err != nil {
+							s.validationErr = fmt.Errorf("invalid regular expression in method name match: %w", err)
+							return
+						}
 					}
 				}
 			}
 		}
+	})
+	return s.validationErr
+}
+
+func (s *GRPCRouteState) GetCompiledHeaderRegex(value string) *regexp.Regexp {
+	s.Validate() // Ensure it's populated
+	if s.compiledHeaderRegexps != nil {
+		return s.compiledHeaderRegexps[value]
 	}
 	return nil
 }
@@ -68,9 +89,12 @@ func (s *GRPCRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentRefe
 	} else {
 		// Check if Gateway exists and has matching listeners
 		var gw *GatewayState
+		expectedNamespace := s.Namespace
+		if parentRef.Namespace != nil {
+			expectedNamespace = string(*parentRef.Namespace)
+		}
 		for _, g := range gateways {
-			if g.Name == string(parentRef.Name) {
-				// Note: for now we only check name, but should check namespace too if specified
+			if g.Name == string(parentRef.Name) && g.Namespace == expectedNamespace {
 				gw = g
 				break
 			}
@@ -164,8 +188,11 @@ func (s *GRPCRouteState) MatchesGateway(gw *gatewayv1.Gateway, controllerName st
 
 	for _, ps := range s.GRPCRoute.Status.Parents {
 		if string(ps.ControllerName) == controllerName {
-			if string(ps.ParentRef.Name) == gw.Name {
-				// Note: for now we only check name, but should check namespace too if specified
+			expectedNamespace := s.Namespace
+			if ps.ParentRef.Namespace != nil {
+				expectedNamespace = string(*ps.ParentRef.Namespace)
+			}
+			if string(ps.ParentRef.Name) == gw.Name && expectedNamespace == gw.Namespace {
 				for _, c := range ps.Conditions {
 					if c.Type == string(gatewayv1.RouteConditionAccepted) && c.Status == metav1.ConditionTrue {
 						return true
