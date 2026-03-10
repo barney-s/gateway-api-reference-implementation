@@ -15,14 +15,14 @@
 package main
 
 import (
-	"encoding/json"
-	"fmt"
-	"io"
-	"log"
-	"net/http"
-	"os"
+        "encoding/json"
+        "fmt"
+        "io"
+        "log"
+        "net/http"
+        "os"
+        "time"
 )
-
 func main() {
 	if len(os.Args) < 2 {
 		log.Fatal("Usage: toolbox <server|client> [args]")
@@ -84,7 +84,9 @@ func runServer() {
 
 func runClient(targetURL, hostname string) {
 	log.Printf("Sending request to %s (Host: %s)", targetURL, hostname)
-	client := &http.Client{}
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
 	req, err := http.NewRequest("GET", targetURL, nil)
 	if err != nil {
 		log.Fatalf("Failed to create request: %v", err)
@@ -93,17 +95,45 @@ func runClient(targetURL, hostname string) {
 		req.Host = hostname
 	}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Fatalf("Request failed: %v", err)
-	}
-	defer resp.Body.Close()
+	var lastErr error
+	var lastStatus string
+	var lastBody string
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Fatalf("Failed to read response body: %v", err)
+	for i := 0; i < 30; i++ {
+		if i > 0 {
+			time.Sleep(2 * time.Second)
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			log.Printf("Attempt %d: Request failed: %v", i+1, err)
+			continue
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			log.Printf("Attempt %d: Failed to read response body: %v", i+1, err)
+			continue
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			fmt.Printf("Status: %s\n", resp.Status)
+			fmt.Printf("Body: %s\n", string(body))
+			return
+		}
+
+		lastStatus = resp.Status
+		lastBody = string(body)
+		lastErr = nil // Clear error since we got a response, even if not 200
+		log.Printf("Attempt %d: Status: %s, Body: %s", i+1, resp.Status, string(body))
 	}
 
-	fmt.Printf("Status: %s\n", resp.Status)
-	fmt.Printf("Body: %s\n", string(body))
+	if lastErr != nil {
+		log.Fatalf("All retries failed, last error: %v", lastErr)
+	} else {
+		log.Fatalf("All retries failed, last status: %s, last body: %s", lastStatus, lastBody)
+	}
 }
