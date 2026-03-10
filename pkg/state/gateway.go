@@ -163,6 +163,10 @@ func (im *InternalMatch) Matches(method, path string, header http.Header) bool {
 			if !hasPathPrefix(path, im.Path.Value) {
 				return false
 			}
+		case gatewayv1.PathMatchRegularExpression:
+			if im.Path.MatchRegularExpressionValue != nil && !im.Path.MatchRegularExpressionValue.MatchString(path) {
+				return false
+			}
 		}
 	}
 
@@ -210,8 +214,9 @@ func hasPathPrefix(path, prefix string) bool {
 }
 
 type InternalPathMatch struct {
-	Type  gatewayv1.PathMatchType
-	Value string
+	Type                        gatewayv1.PathMatchType
+	Value                       string
+	MatchRegularExpressionValue *regexp.Regexp
 }
 
 type InternalHeaderMatch struct {
@@ -297,6 +302,8 @@ func getPathMatchTypeWeight(t gatewayv1.PathMatchType) int {
 		return 3
 	case gatewayv1.PathMatchPathPrefix:
 		return 2
+	case gatewayv1.PathMatchRegularExpression:
+		return 2
 	case "":
 		return 1
 	default:
@@ -311,22 +318,31 @@ func getPathLen(m *InternalMatch) int {
 	return len(m.Path.Value)
 }
 
-func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRoutes []*GRPCRouteState, services map[types.NamespacedName]*corev1.Service, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, controllerName string) []InternalRoute {
+type BuildInternalRoutesContext struct {
+	HTTPRoutes         []*HTTPRouteState
+	GRPCRoutes         []*GRPCRouteState
+	Services           map[types.NamespacedName]*corev1.Service
+	BackendTLSPolicies []*gatewayv1.BackendTLSPolicy
+	ConfigMaps         map[types.NamespacedName]*corev1.ConfigMap
+	ControllerName     string
+}
+
+func (s *GatewayState) BuildInternalRoutes(ctx BuildInternalRoutesContext) []InternalRoute {
 	// Sort policies by creation timestamp, then by namespaced name to ensure deterministic conflict resolution.
-	sort.SliceStable(backendTLSPolicies, func(i, j int) bool {
-		if backendTLSPolicies[i].CreationTimestamp.Time.Before(backendTLSPolicies[j].CreationTimestamp.Time) {
+	sort.SliceStable(ctx.BackendTLSPolicies, func(i, j int) bool {
+		if ctx.BackendTLSPolicies[i].CreationTimestamp.Time.Before(ctx.BackendTLSPolicies[j].CreationTimestamp.Time) {
 			return true
 		}
-		if backendTLSPolicies[i].CreationTimestamp.Time.After(backendTLSPolicies[j].CreationTimestamp.Time) {
+		if ctx.BackendTLSPolicies[i].CreationTimestamp.Time.After(ctx.BackendTLSPolicies[j].CreationTimestamp.Time) {
 			return false
 		}
-		if backendTLSPolicies[i].Namespace < backendTLSPolicies[j].Namespace {
+		if ctx.BackendTLSPolicies[i].Namespace < ctx.BackendTLSPolicies[j].Namespace {
 			return true
 		}
-		if backendTLSPolicies[i].Namespace > backendTLSPolicies[j].Namespace {
+		if ctx.BackendTLSPolicies[i].Namespace > ctx.BackendTLSPolicies[j].Namespace {
 			return false
 		}
-		return backendTLSPolicies[i].Name < backendTLSPolicies[j].Name
+		return ctx.BackendTLSPolicies[i].Name < ctx.BackendTLSPolicies[j].Name
 	})
 
 	var internalRoutes []InternalRoute
@@ -334,7 +350,7 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 	for _, listener := range s.Spec.Listeners {
 		// HTTPRoutes
 		if listener.Protocol == gatewayv1.HTTPProtocolType || listener.Protocol == gatewayv1.HTTPSProtocolType {
-			for _, route := range httpRoutes {
+			for _, route := range ctx.HTTPRoutes {
 				// Check if this route is bound to this Gateway and specifically this listener (if SectionName is set)
 				bound := false
 				var matchingParentRef *gatewayv1.ParentReference
@@ -438,6 +454,16 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 							}
 
 							if backendRef.Port == nil {
+								iRule.Error = &ErrorState{
+									Condition: metav1.Condition{
+										Type:    string(gatewayv1.RouteConditionResolvedRefs),
+										Status:  metav1.ConditionFalse,
+										Reason:  string(gatewayv1.RouteReasonInvalidKind),
+										Message: "Backend port must be specified",
+									},
+									HTTPStatusCode: http.StatusInternalServerError,
+									HTTPMessage:    "Backend port must be specified",
+								}
 								continue
 							}
 
@@ -451,7 +477,7 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 								Name:      string(backendRef.Name),
 							}
 							var appProtocol *string
-							if svc, ok := services[backendSvcName]; ok {
+							if svc, ok := ctx.Services[backendSvcName]; ok {
 								for _, port := range svc.Spec.Ports {
 									if port.Port == int32(*backendRef.Port) {
 										appProtocol = port.AppProtocol
@@ -462,7 +488,7 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 
 							// Check for BackendTLSPolicy
 							var tlsConfig *InternalTLSConfig
-							for _, policy := range backendTLSPolicies {
+							for _, policy := range ctx.BackendTLSPolicies {
 								if tlsConfig != nil {
 									break
 								}
@@ -478,7 +504,7 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 										for _, caRef := range policy.Spec.Validation.CACertificateRefs {
 											if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
 												cmName := types.NamespacedName{Namespace: policy.Namespace, Name: string(caRef.Name)}
-												if cm, ok := configMaps[cmName]; ok {
+												if cm, ok := ctx.ConfigMaps[cmName]; ok {
 													if data, ok := cm.Data["ca.crt"]; ok {
 														caCerts = append(caCerts, []byte(data))
 													} else if data, ok := cm.BinaryData["ca.crt"]; ok {
@@ -559,7 +585,7 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 
 		// GRPCRoutes
 		if listener.Protocol == gatewayv1.HTTPProtocolType || listener.Protocol == gatewayv1.HTTPSProtocolType || listener.Protocol == "TLS" {
-			for _, route := range grpcRoutes {
+			for _, route := range ctx.GRPCRoutes {
 				bound := false
 				for i := range route.Spec.ParentRefs {
 					parentRef := &route.Spec.ParentRefs[i]
@@ -599,7 +625,25 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 				for _, rule := range route.Spec.Rules {
 					iRule := InternalRule{}
 
-					if resolvedRefsCond.Status == metav1.ConditionFalse {
+					for _, filter := range rule.Filters {
+						if filter.Type != "" {
+							iRule.Error = &ErrorState{
+								Condition: metav1.Condition{
+									Type:    string(gatewayv1.RouteConditionResolvedRefs),
+									Status:  metav1.ConditionFalse,
+									Reason:  string(gatewayv1.RouteReasonUnsupportedValue),
+									Message: fmt.Sprintf("Unsupported filter type: %s", filter.Type),
+								},
+								HTTPStatusCode: http.StatusInternalServerError,
+								HTTPMessage:    fmt.Sprintf("Unsupported filter type: %s", filter.Type),
+							}
+							break
+						}
+					}
+
+					if iRule.Error != nil {
+						// Skip backend building since we already have an error
+					} else if resolvedRefsCond.Status == metav1.ConditionFalse {
 						iRule.Error = &ErrorState{
 							Condition:      resolvedRefsCond,
 							HTTPStatusCode: http.StatusInternalServerError,
@@ -626,6 +670,16 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 							}
 
 							if backendRef.Port == nil {
+								iRule.Error = &ErrorState{
+									Condition: metav1.Condition{
+										Type:    string(gatewayv1.RouteConditionResolvedRefs),
+										Status:  metav1.ConditionFalse,
+										Reason:  string(gatewayv1.RouteReasonInvalidKind),
+										Message: "Backend port must be specified",
+									},
+									HTTPStatusCode: http.StatusInternalServerError,
+									HTTPMessage:    "Backend port must be specified",
+								}
 								continue
 							}
 
@@ -639,12 +693,68 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 								weight = *backendRef.Weight
 							}
 
-							// For GRPCRoute, we often use h2c or https
-							h2c := "kubernetes.io/h2c"
-							appProtocol := &h2c
-							if listener.Protocol == gatewayv1.HTTPSProtocolType {
-								https := "https"
-								appProtocol = &https
+							backendSvcName := types.NamespacedName{
+								Namespace: backendSvcNamespace,
+								Name:      string(backendRef.Name),
+							}
+							var appProtocol *string
+							svc, ok := ctx.Services[backendSvcName]
+							if !ok {
+								iRule.Error = &ErrorState{
+									Condition: metav1.Condition{
+										Type:    string(gatewayv1.RouteConditionResolvedRefs),
+										Status:  metav1.ConditionFalse,
+										Reason:  string(gatewayv1.RouteReasonBackendNotFound),
+										Message: fmt.Sprintf("Backend service %s not found", backendSvcName),
+									},
+									HTTPStatusCode: http.StatusInternalServerError,
+									HTTPMessage:    fmt.Sprintf("Backend service %s not found", backendSvcName),
+								}
+								continue
+							}
+							for _, p := range svc.Spec.Ports {
+								if p.Port == int32(*backendRef.Port) {
+									appProtocol = p.AppProtocol
+									break
+								}
+							}
+
+							var tlsConfig *InternalTLSConfig
+							for _, policy := range ctx.BackendTLSPolicies {
+								if tlsConfig != nil {
+									break
+								}
+								for _, targetRef := range policy.Spec.TargetRefs {
+									if string(targetRef.Group) == "" && string(targetRef.Kind) == "Service" &&
+										string(targetRef.Name) == string(backendRef.Name) &&
+										policy.Namespace == backendSvcNamespace {
+										https := "https"
+										appProtocol = &https
+
+										var caCerts [][]byte
+										for _, caRef := range policy.Spec.Validation.CACertificateRefs {
+											if string(caRef.Group) == "" && string(caRef.Kind) == "ConfigMap" {
+												cmName := types.NamespacedName{Namespace: policy.Namespace, Name: string(caRef.Name)}
+												if cm, ok := ctx.ConfigMaps[cmName]; ok {
+													if certData, ok := cm.Data["ca.crt"]; ok {
+														caCerts = append(caCerts, []byte(certData))
+													}
+												}
+											}
+										}
+
+										tlsConfig = &InternalTLSConfig{
+											Hostname: string(policy.Spec.Validation.Hostname),
+											CACerts:  caCerts,
+										}
+										break
+									}
+								}
+							}
+
+							if appProtocol == nil {
+								h2c := "kubernetes.io/h2c"
+								appProtocol = &h2c
 							}
 
 							iRule.Backends = append(iRule.Backends, InternalWeightedBackend{
@@ -652,6 +762,7 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 									Host:        fmt.Sprintf("%s.%s.svc.cluster.local", backendRef.Name, backendSvcNamespace),
 									Port:        int32(*backendRef.Port),
 									AppProtocol: appProtocol,
+									TLSConfig:   tlsConfig,
 								},
 								Weight: weight,
 							})
@@ -664,18 +775,52 @@ func (s *GatewayState) BuildInternalRoutes(httpRoutes []*HTTPRouteState, grpcRou
 							// Translate gRPC service/method to path match
 							service := ValueOf(match.Method.Service)
 							method := ValueOf(match.Method.Method)
-							if service != "" || method != "" {
-								path := "/"
-								if service != "" {
-									path += service
-								}
-								path += "/"
-								if method != "" {
-									path += method
-								}
+
+							matchType := gatewayv1.GRPCMethodMatchExact
+							if match.Method.Type != nil {
+								matchType = *match.Method.Type
+							}
+
+							if matchType == gatewayv1.GRPCMethodMatchRegularExpression {
 								iMatch.Path = &InternalPathMatch{
-									Type:  gatewayv1.PathMatchPathPrefix,
-									Value: path,
+									Type: gatewayv1.PathMatchRegularExpression,
+								}
+								var pattern string
+								if service != "" {
+									pattern = "^/" + service + "/"
+								} else {
+									pattern = "^/[^/]+/"
+								}
+								if method != "" {
+									pattern += method + "$"
+								} else {
+									pattern += ".*$"
+								}
+								iMatch.Path.Value = pattern
+								re, err := regexp.Compile(pattern)
+								if err == nil {
+									iMatch.Path.MatchRegularExpressionValue = re
+								}
+							} else {
+								if service != "" && method != "" {
+									iMatch.Path = &InternalPathMatch{
+										Type:  gatewayv1.PathMatchExact,
+										Value: "/" + service + "/" + method,
+									}
+								} else if service != "" && method == "" {
+									iMatch.Path = &InternalPathMatch{
+										Type:  gatewayv1.PathMatchPathPrefix,
+										Value: "/" + service + "/",
+									}
+								} else if service == "" && method != "" {
+									iMatch.Path = &InternalPathMatch{
+										Type:  gatewayv1.PathMatchRegularExpression,
+										Value: "^/[^/]+/" + method + "$",
+									}
+									re, err := regexp.Compile("^/[^/]+/" + method + "$")
+									if err == nil {
+										iMatch.Path.MatchRegularExpressionValue = re
+									}
 								}
 							}
 						}

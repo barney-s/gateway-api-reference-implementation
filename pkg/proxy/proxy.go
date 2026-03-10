@@ -71,8 +71,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if len(bestRule.Backends) > 0 {
-			backend := p.pickBackend(bestRule.Backends)
-			p.forward(w, r, backend)
+			backend, err := p.pickBackend(bestRule.Backends)
+			if err != nil {
+				http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			p.forward(w, r, *backend)
 			return
 		}
 	}
@@ -80,33 +84,36 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, fmt.Sprintf("No route for host %s and path %s", r.Host, r.URL.Path), http.StatusNotFound)
 }
 
-func (p *Proxy) pickBackend(backends []state.InternalWeightedBackend) state.InternalBackend {
-	if len(backends) == 1 {
-		return backends[0].InternalBackend
+func (p *Proxy) pickBackend(backends []state.InternalWeightedBackend) (*state.InternalBackend, error) {
+	if len(backends) == 0 {
+		return nil, fmt.Errorf("no backends")
 	}
 
-	var totalWeight int32
+	var totalWeight int64
 	for _, b := range backends {
-		totalWeight += b.Weight
+		totalWeight += int64(b.Weight)
 	}
 
 	if totalWeight == 0 {
-		// If all weights are 0, we can pick any (e.g. the first one)
-		// or return an error. For reference implementation, we pick the first one.
-		return backends[0].InternalBackend
+		// If all weights are 0, the request MUST be rejected with a 503 (Service Unavailable) status.
+		return nil, fmt.Errorf("all backends have 0 weight")
+	}
+
+	if len(backends) == 1 {
+		return &backends[0].InternalBackend, nil
 	}
 
 	// Use a simple random selection based on weight for this reference implementation
-	r := rand.Int31n(totalWeight)
-	var currentWeight int32
+	r := rand.Int63n(totalWeight)
+	var currentWeight int64
 	for _, b := range backends {
-		currentWeight += b.Weight
+		currentWeight += int64(b.Weight)
 		if r < currentWeight {
-			return b.InternalBackend
+			return &b.InternalBackend, nil
 		}
 	}
 
-	return backends[0].InternalBackend
+	return &backends[0].InternalBackend, nil
 }
 
 func (p *Proxy) redirect(w http.ResponseWriter, r *http.Request, redirect state.InternalRedirect, match *state.InternalMatch) {

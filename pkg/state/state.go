@@ -111,7 +111,7 @@ func (s *State) DeleteGateway(name types.NamespacedName) {
 
 func (s *State) UpsertHTTPRoute(route *gatewayv1.HTTPRoute) metav1.Condition {
 	rs := &HTTPRouteState{
-		HTTPRoute: route,
+		HTTPRoute: route.DeepCopy(),
 	}
 
 	status := metav1.ConditionTrue
@@ -148,7 +148,7 @@ func (s *State) DeleteHTTPRoute(name types.NamespacedName) {
 
 func (s *State) UpsertGRPCRoute(route *gatewayv1.GRPCRoute) metav1.Condition {
 	rs := &GRPCRouteState{
-		GRPCRoute: route,
+		GRPCRoute: route.DeepCopy(),
 	}
 
 	status := metav1.ConditionTrue

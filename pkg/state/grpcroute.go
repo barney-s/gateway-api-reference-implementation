@@ -26,6 +26,22 @@ type GRPCRouteState struct {
 }
 
 func (s *GRPCRouteState) Validate() error {
+	if s.GRPCRoute == nil {
+		return fmt.Errorf("GRPCRoute is nil")
+	}
+
+	for _, rule := range s.Spec.Rules {
+		for _, filter := range rule.Filters {
+			if filter.Type != gatewayv1.GRPCRouteFilterRequestHeaderModifier && filter.Type != gatewayv1.GRPCRouteFilterResponseHeaderModifier && filter.Type != gatewayv1.GRPCRouteFilterRequestMirror {
+				return fmt.Errorf("unsupported filter type: %s", filter.Type)
+			}
+		}
+		for _, backendRef := range rule.BackendRefs {
+			if backendRef.Weight != nil && *backendRef.Weight < 0 {
+				return fmt.Errorf("backend weight cannot be negative")
+			}
+		}
+	}
 	return nil
 }
 
@@ -38,6 +54,9 @@ func (s *GRPCRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentRefe
 	var gw *GatewayState
 	for _, g := range gateways {
 		if g.Name == string(parentRef.Name) {
+			if parentRef.Namespace != nil && string(*parentRef.Namespace) != g.Namespace {
+				continue
+			}
 			gw = g
 			break
 		}
@@ -50,7 +69,7 @@ func (s *GRPCRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentRefe
 	} else {
 		matched := false
 		for _, listener := range gw.Spec.Listeners {
-			if listener.Protocol != gatewayv1.HTTPProtocolType && listener.Protocol != gatewayv1.HTTPSProtocolType && listener.Protocol != "TLS" {
+			if listener.Protocol != gatewayv1.HTTPProtocolType && listener.Protocol != gatewayv1.HTTPSProtocolType {
 				continue
 			}
 			if sectionName := ValueOf(parentRef.SectionName); sectionName != "" && sectionName != listener.Name {
