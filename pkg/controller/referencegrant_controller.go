@@ -25,7 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
 type ReferenceGrantReconciler struct {
@@ -38,7 +38,7 @@ type ReferenceGrantReconciler struct {
 func (r *ReferenceGrantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
 
-	rg := &gatewayv1beta1.ReferenceGrant{}
+	rg := &gatewayv1.ReferenceGrant{}
 	if err := r.Get(ctx, req.NamespacedName, rg); err != nil {
 		if apierrors.IsNotFound(err) {
 			r.State.DeleteReferenceGrant(req.NamespacedName)
@@ -50,7 +50,7 @@ func (r *ReferenceGrantReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	r.State.UpsertReferenceGrant(rg)
 	r.updateProxy()
 
-	l.Info("Updated ReferenceGrant")
+	l.Info("Updated ReferenceGrant", "namespace", req.Namespace, "name", req.Name)
 
 	return ctrl.Result{}, nil
 }
@@ -61,6 +61,6 @@ func (r *ReferenceGrantReconciler) updateProxy() {
 
 func (r *ReferenceGrantReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&gatewayv1beta1.ReferenceGrant{}).
+		For(&gatewayv1.ReferenceGrant{}).
 		Complete(r)
 }

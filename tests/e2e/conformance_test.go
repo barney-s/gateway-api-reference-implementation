@@ -25,7 +25,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
-	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 	"sigs.k8s.io/gateway-api/conformance"
 	"sigs.k8s.io/gateway-api/conformance/tests"
 	"sigs.k8s.io/gateway-api/conformance/utils/suite"
@@ -63,16 +62,12 @@ func TestConformance(t *testing.T) {
 	if err := gatewayv1.AddToScheme(s); err != nil {
 		t.Fatalf("Error adding Gateway API v1 types to scheme: %v", err)
 	}
-	if err := gatewayv1beta1.AddToScheme(s); err != nil {
-		t.Fatalf("Error adding Gateway API v1beta1 types to scheme: %v", err)
-	}
 	if err := gatewayv1alpha2.AddToScheme(s); err != nil {
 		t.Fatalf("Error adding Gateway API v1alpha2 types to scheme: %v", err)
 	}
 
 	// Also register in the global scheme
 	gatewayv1.AddToScheme(scheme.Scheme)
-	gatewayv1beta1.AddToScheme(scheme.Scheme)
 	gatewayv1alpha2.AddToScheme(scheme.Scheme)
 
 	cl, err := client.New(cfg, client.Options{Scheme: s})
@@ -102,6 +97,7 @@ func TestConformance(t *testing.T) {
 		tests.HTTPRouteHeaderMatching,
 		tests.HTTPRouteHostnameIntersection,
 		tests.HTTPRouteCrossNamespace,
+		tests.HTTPRouteReferenceGrant,
 		tests.HTTPRouteInvalidBackendRefUnknownKind,
 		tests.HTTPRouteBackendProtocolH2C,
 		tests.BackendTLSPolicy,

@@ -26,7 +26,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
-	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 type GatewayState struct {
@@ -307,7 +306,7 @@ func getPathLen(m *InternalMatch) int {
 	return len(m.Path.Value)
 }
 
-func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services map[types.NamespacedName]*corev1.Service, referenceGrants []*gatewayv1beta1.ReferenceGrant, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, controllerName string) []InternalRoute {
+func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services map[types.NamespacedName]*corev1.Service, referenceGrants []*gatewayv1.ReferenceGrant, backendTLSPolicies []*gatewayv1.BackendTLSPolicy, configMaps map[types.NamespacedName]*corev1.ConfigMap, controllerName string) []InternalRoute {
 	// Sort policies by creation timestamp, then by namespaced name to ensure deterministic conflict resolution.
 	sort.SliceStable(backendTLSPolicies, func(i, j int) bool {
 		if backendTLSPolicies[i].CreationTimestamp.Time.Before(backendTLSPolicies[j].CreationTimestamp.Time) {
@@ -438,7 +437,7 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 								HTTPStatusCode: http.StatusInternalServerError,
 								HTTPMessage:    fmt.Sprintf("Unsupported backend kind: %s", kind),
 							}
-							continue
+							break
 						}
 
 						if backendRef.Port == nil {
@@ -462,7 +461,7 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 									HTTPStatusCode: http.StatusInternalServerError,
 									HTTPMessage:    fmt.Sprintf("Reference to Service %s/%s not permitted by ReferenceGrant", backendSvcNamespace, backendRef.Name),
 								}
-								continue
+								break
 							}
 						}
 
@@ -575,7 +574,7 @@ func (s *GatewayState) BuildInternalRoutes(routes []*HTTPRouteState, services ma
 	return internalRoutes
 }
 
-func isReferenceAllowed(fromKind, fromNamespace, toKind, toNamespace, toName string, grants []*gatewayv1beta1.ReferenceGrant) bool {
+func isReferenceAllowed(fromKind, fromNamespace, toKind, toNamespace, toName string, grants []*gatewayv1.ReferenceGrant) bool {
 	if fromNamespace == toNamespace {
 		return true
 	}
@@ -598,7 +597,7 @@ func isReferenceAllowed(fromKind, fromNamespace, toKind, toNamespace, toName str
 		}
 
 		for _, to := range grant.Spec.To {
-			if string(to.Group) == "" && string(to.Kind) == toKind {
+			if (string(to.Group) == "" || string(to.Group) == "core") && string(to.Kind) == toKind {
 				if to.Name == nil || string(*to.Name) == toName {
 					return true
 				}

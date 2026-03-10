@@ -16,11 +16,11 @@ package state
 
 import (
 	"fmt"
+	"k8s.io/klog/v2"
 	"regexp"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
-	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 type HTTPRouteState struct {
@@ -56,12 +56,12 @@ func (s *HTTPRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentRefe
 		acceptedMessage = fmt.Sprintf("Invalid route: %v", err)
 	} else {
 		// Check if Gateway exists and has matching listeners
+		gwNamespace := s.Namespace
+		if parentRef.Namespace != nil {
+			gwNamespace = string(*parentRef.Namespace)
+		}
 		var gw *GatewayState
 		for _, g := range gateways {
-			gwNamespace := s.Namespace
-			if parentRef.Namespace != nil {
-				gwNamespace = string(*parentRef.Namespace)
-			}
 			if g.Name == string(parentRef.Name) && g.Namespace == gwNamespace {
 				gw = g
 				break
@@ -71,9 +71,11 @@ func (s *HTTPRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentRefe
 		if gw == nil {
 			acceptedStatus = metav1.ConditionFalse
 			acceptedReason = gatewayv1.RouteReasonNoMatchingParent
-			acceptedMessage = fmt.Sprintf("Gateway %s/%s not found", ValueOf(parentRef.Namespace), parentRef.Name)
+			acceptedMessage = fmt.Sprintf("Gateway %s/%s not found", gwNamespace, parentRef.Name)
+
 		} else {
 			matched := false
+			rejectedByAllowedRoutes := false
 			for _, listener := range gw.Spec.Listeners {
 				if listener.Protocol != gatewayv1.HTTPProtocolType && listener.Protocol != gatewayv1.HTTPSProtocolType {
 					continue
@@ -83,6 +85,7 @@ func (s *HTTPRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentRefe
 				}
 
 				if !isRouteAllowed(gw.Namespace, listener.AllowedRoutes, s.Namespace) {
+					rejectedByAllowedRoutes = true
 					continue
 				}
 
@@ -94,8 +97,13 @@ func (s *HTTPRouteState) ComputeAcceptedCondition(parentRef gatewayv1.ParentRefe
 			}
 			if !matched {
 				acceptedStatus = metav1.ConditionFalse
-				acceptedReason = gatewayv1.RouteReasonNoMatchingListenerHostname
-				acceptedMessage = "No matching listener hostname or route not allowed by listener"
+				if rejectedByAllowedRoutes {
+					acceptedReason = gatewayv1.RouteReasonNotAllowedByListeners
+					acceptedMessage = "Route not allowed by listener"
+				} else {
+					acceptedReason = gatewayv1.RouteReasonNoMatchingListenerHostname
+					acceptedMessage = "No matching listener hostname"
+				}
 			}
 		}
 	}
@@ -123,12 +131,13 @@ func isRouteAllowed(gwNamespace string, allowed *gatewayv1.AllowedRoutes, routeN
 	case gatewayv1.NamespacesFromSelector:
 		// TODO: Implement selector matching. For now, we don't have namespace labels.
 		// Conformance tests for cross-namespace often use 'All'.
+		klog.Warningf("NamespacesFromSelector is not yet supported; rejecting route in namespace %s for gateway in %s", routeNamespace, gwNamespace)
 		return false
 	}
 	return gwNamespace == routeNamespace
 }
 
-func (s *HTTPRouteState) ComputeResolvedRefsCondition(referenceGrants []*gatewayv1beta1.ReferenceGrant) metav1.Condition {
+func (s *HTTPRouteState) ComputeResolvedRefsCondition(referenceGrants []*gatewayv1.ReferenceGrant) metav1.Condition {
 	resolvedRefsStatus := metav1.ConditionTrue
 	resolvedRefsReason := gatewayv1.RouteReasonResolvedRefs
 	resolvedRefsMessage := "All references resolved"
